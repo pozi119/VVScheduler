@@ -1,0 +1,16 @@
+PODS:
+  - VVScheduler (0.1.0)
+
+DEPENDENCIES:
+  - VVScheduler (from `../`)
+
+EXTERNAL SOURCES:
+  VVScheduler:
+    :path: "../"
+
+SPEC CHECKSUMS:
+  VVScheduler: 967e655b866ce238b5aeee41669d5e748a8885cf
+
+PODFILE CHECKSUM: 35aa79a40dab1995e07b3373e4d8b64c3d853fe9
+
+COCOAPODS: 1.8.4
