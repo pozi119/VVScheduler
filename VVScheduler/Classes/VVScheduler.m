@@ -53,8 +53,8 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 @interface VVSchedulerItemExtra : NSObject
 @property (nonatomic, assign) CFAbsoluteTime suspendTime;
-@property (nonatomic, assign) CFAbsoluteTime lastUpdateTime;
-@property (nonatomic, assign) float lastFractionCompleted;
+@property (nonatomic, assign) CFAbsoluteTime updateAt;
+@property (nonatomic, assign) float lastProgress;
 @end
 
 @implementation VVSchedulerItemExtra
@@ -187,28 +187,25 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         switch (task.state) {
             case VVSchedulerTaskStateRunning: {
                 float fractionCompleted = task.progress.fractionCompleted;
-                if (running < _maxActivations) {
-                    if (fractionCompleted <= extra.lastFractionCompleted && now - extra.lastUpdateTime > _timeout) {
-                        extra.suspendTime = now;
-                        [(NSObject *)task performSelector:@selector(suspend) onThread:self.thread withObject:nil waitUntilDone:NO];
-                        //NSLog(@"---> delay: %@", task);
-                    } else {
-                        running++;
-                    }
-                } else {
-                    extra.lastUpdateTime = now;
+                BOOL delay = fractionCompleted <= extra.lastProgress && now - extra.updateAt > _timeout;
+                if (running >= _maxActivations || delay) {
+                    if (delay) extra.suspendTime = now;
                     [(NSObject *)task performSelector:@selector(suspend) onThread:self.thread withObject:nil waitUntilDone:NO];
                     pause++;
+                } else {
+                    extra.updateAt = now;
+                    running++;
                 }
-                extra.lastFractionCompleted = fractionCompleted;
+                extra.lastProgress = fractionCompleted;
                 break;
             }
             case VVSchedulerTaskStateSuspended: {
-                if (running < _maxActivations && (extra.suspendTime == 0 || (now - extra.suspendTime > _durationOfSuspension))) {
+                BOOL wakeup = extra.suspendTime == 0 || (now - extra.suspendTime > _durationOfSuspension);
+                if (running < _maxActivations && wakeup) {
                     [(NSObject *)task performSelector:@selector(resume) onThread:self.thread withObject:nil waitUntilDone:NO];
                     //NSLog(@"---> resume: %@", task);
-                    extra.lastUpdateTime = now;
-                    extra.lastFractionCompleted = task.progress.fractionCompleted;
+                    extra.updateAt = now;
+                    extra.lastProgress = task.progress.fractionCompleted;
                     extra.suspendTime = 0;
                     running++;
                     resume++;
