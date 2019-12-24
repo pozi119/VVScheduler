@@ -6,6 +6,8 @@
 //
 
 #import "VVScheduler.h"
+#import "VVThreadMutableArray.h"
+#import "VVThreadMutableDictionary.h"
 
 @interface NSThread (VVScheduler)
 
@@ -60,12 +62,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 @interface VVScheduler ()
 @property (nonatomic, assign) VVSchedulerPolicy policy;
-@property (nonatomic, strong) dispatch_semaphore_t lock;
 @property (nonatomic, strong) dispatch_source_t timer;
-@property (nonatomic, strong) NSMutableArray<VVSchedulerItem> *runningTasks;
-@property (nonatomic, strong) NSMutableArray<VVSchedulerItem> *suspendTasks;
-@property (nonatomic, strong) NSMutableDictionary<VVSchedulerKey, VVSchedulerItem> *allTasks;
-@property (nonatomic, strong) NSMutableDictionary<VVSchedulerKey, VVSchedulerItemExtra *> *allExtras;
+@property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *runningTasks;
+@property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *suspendTasks;
+@property (nonatomic, strong) VVThreadMutableDictionary<VVSchedulerKey, VVSchedulerItem> *allTasks;
+@property (nonatomic, strong) VVThreadMutableDictionary<VVSchedulerKey, VVSchedulerItemExtra *> *allExtras;
 @property (nonatomic, strong) VVMergeValve *mergeValve;
 @property (nonatomic, strong) dispatch_queue_t queue;
 @property (nonatomic, strong) NSThread *thread;
@@ -88,11 +89,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         _interval = 1.0;
         _policy = policy;
         _autoPoll = NO;
-        _runningTasks = [NSMutableArray array];
-        _suspendTasks = [NSMutableArray array];
-        _allTasks = [NSMutableDictionary dictionary];
-        _allExtras = [NSMutableDictionary dictionary];
-        _lock = dispatch_semaphore_create(1);
+        _runningTasks = [VVThreadMutableArray array];
+        _suspendTasks = [VVThreadMutableArray array];
+        _allTasks = [VVThreadMutableDictionary dictionary];
+        _allExtras = [VVThreadMutableDictionary dictionary];
         _queue = dispatch_create_scheduler_queue(NULL, DISPATCH_QUEUE_CONCURRENT);
         _thread = dispatch_create_scheduler_thread(nil, NSQualityOfServiceUserInitiated);
         [self setupTimer];
@@ -131,14 +131,12 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)setAutoPoll:(BOOL)autoPoll
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     _autoPoll = autoPoll;
     if (autoPoll) {
         dispatch_resume(self.timer);
     } else {
         dispatch_suspend(self.timer);
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)manualPoll
@@ -166,7 +164,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     if (_runningTasks.count == 0) {
         return;
     }
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     //MARK: VVSchedulerPolicyPriority not supported
     /*
     if (_policy == VVSchedulerPolicyPriority) {
@@ -237,12 +234,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     if (!_autoPoll) {
         [self performSelector:@selector(delayPoll) onThread:self.thread withObject:nil waitUntilDone:NO];
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)addTask:(VVSchedulerItem)task
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem newTask = task;
     VVSchedulerItem oldTask = [_allTasks objectForKey:task.identifier];
     if (oldTask) {
@@ -268,12 +263,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         [_runningTasks addObject:task];
     }
     //NSLog(@"---> add task: %@", taskId);
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)addTasks:(NSArray<VVSchedulerItem> *)tasks
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSMutableArray *removeTasks = [NSMutableArray array];
     NSMutableArray *appendTasks = [NSMutableArray array];
     NSMutableArray *removeKeys = [NSMutableArray array];
@@ -308,12 +301,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         [_runningTasks addObjectsFromArray:appendTasks];
     }
     _mergeValve.interval = MIN(1.0, MAX(0.1, (_runningTasks.count / 100) * 0.1));
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)suspendTask:(VVSchedulerKey)taskId
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
         if ([_runningTasks containsObject:task]) {
@@ -322,12 +313,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         [_runningTasks removeObject:task];
         [_suspendTasks addObject:task];
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)suspendTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
@@ -339,23 +328,19 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     }
     [_runningTasks removeObjectsInArray:changes];
     [_suspendTasks addObjectsFromArray:changes];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)resumeTask:(VVSchedulerKey)taskId
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task && [_suspendTasks containsObject:task]) {
         [_suspendTasks removeObject:task];
         [_runningTasks addObject:task];
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)resumeTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
@@ -365,7 +350,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     }
     [_suspendTasks removeObjectsInArray:changes];
     [_runningTasks addObjectsFromArray:changes];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)removeTask:(VVSchedulerKey)taskId
@@ -380,7 +364,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)removeTask:(VVSchedulerKey)taskId cancel:(BOOL)cancel
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
         if (cancel && task.state < VVSchedulerTaskStateCanceling) {
@@ -393,12 +376,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         [_allExtras removeObjectForKey:taskId];
         //NSLog(@"---> remove task: %@", taskId);
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)cancelAndRemoveTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
@@ -412,12 +393,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     [_suspendTasks removeObjectsInArray:changes];
     [_allTasks removeObjectsForKeys:taskIds];
     [_allExtras removeObjectsForKeys:taskIds];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)cancelAndRemoveAllTasks
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     for (VVSchedulerItem task in _allTasks.allValues) {
         if (task.state < VVSchedulerTaskStateCanceling) {
             [(NSObject *)task performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
@@ -427,13 +406,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     [_suspendTasks removeAllObjects];
     [_allTasks removeAllObjects];
     [_allExtras removeAllObjects];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)prioritizeTask:(VVSchedulerKey)taskId {
     if (!taskId) return;
 
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
         //NSLog(@"---> prioritize task: %@", taskId);
@@ -452,12 +429,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         }
          */
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)prioritizeTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
@@ -468,14 +443,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     [_suspendTasks removeObjectsInArray:changes];
     NSIndexSet *indexSet = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, changes.count)];
     [_runningTasks insertObjects:changes atIndexes:indexSet];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (nullable id<VVSchedulerTask>)objectForKeyedSubscript:(VVSchedulerKey)key
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     VVSchedulerItem task = [_allTasks objectForKey:key];
-    dispatch_semaphore_signal(_lock);
     return task;
 }
 
@@ -491,9 +463,8 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 @end
 
 @interface VVMergeValve ()
-@property (nonatomic, strong) NSMutableArray *objects;
-@property (nonatomic, strong) NSMutableDictionary *keyObjects;
-@property (nonatomic, strong) dispatch_semaphore_t lock;
+@property (nonatomic, strong) VVThreadMutableArray *objects;
+@property (nonatomic, strong) VVThreadMutableDictionary *keyObjects;
 @property (nonatomic, strong) dispatch_queue_t queue;
 @end
 
@@ -505,9 +476,8 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     if (self) {
         _interval = 0.1;
         _maxMergeCount = 100;
-        _objects = [NSMutableArray array];
-        _keyObjects = [NSMutableDictionary dictionary];
-        _lock = dispatch_semaphore_create(1);
+        _objects = [VVThreadMutableArray array];
+        _keyObjects = [VVThreadMutableDictionary dictionary];
         _queue = dispatch_create_scheduler_queue("merge", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -517,7 +487,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 {
     if (!key) return;
 
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     if (self.keyObjects.count == 0) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.interval * NSEC_PER_SEC)), self.queue, ^{
             [self runMergeOpreation];
@@ -531,7 +500,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     if (object) {
         [self.objects insertObject:object atIndex:0];
     }
-    dispatch_semaphore_signal(_lock);
     if (self.objects.count >= self.maxMergeCount) {
         [self runMergeOpreation];
     }
@@ -540,12 +508,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 - (void)runMergeOpreation
 {
     if (!self.mergeAction) return;
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     NSArray *objects = self.objects.copy;
     NSDictionary *keyObjects = self.keyObjects.copy;
     [self.objects removeAllObjects];
     [self.keyObjects removeAllObjects];
-    dispatch_semaphore_signal(_lock);
     self.mergeAction(objects, keyObjects);
 }
 
@@ -554,8 +520,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 @interface VVLimitValve ()
 @property (nonatomic, strong) dispatch_queue_t queue;
 @property (nonatomic, strong) dispatch_source_t timer;
-@property (nonatomic, strong) dispatch_semaphore_t lock;
-@property (nonatomic, strong) NSMutableArray *objects;
+@property (nonatomic, strong) VVThreadMutableArray *objects;
 @property (nonatomic, assign) BOOL running;
 @end
 
@@ -565,9 +530,8 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 {
     self = [super init];
     if (self) {
-        _objects = [NSMutableArray array];
+        _objects = [VVThreadMutableArray array];
         _queue = dispatch_create_scheduler_queue("limit", DISPATCH_QUEUE_SERIAL);
-        _lock = dispatch_semaphore_create(1);
         [self setupTimer];
     }
     return self;
@@ -590,18 +554,15 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)addObject:(id)object
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     if (self.objects.count == 0 && !_running) {
         _running = YES;
         dispatch_resume(self.timer);
     }
     [self.objects addObject:object];
-    dispatch_semaphore_signal(_lock);
 }
 
 - (void)poll
 {
-    dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
     if (self.objects.count > 0) {
         id object = self.objects.firstObject;
         [self.objects removeObjectAtIndex:0];
@@ -611,7 +572,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         }
         if (self.takeAction) self.takeAction(object);
     }
-    dispatch_semaphore_signal(_lock);
 }
 
 @end
