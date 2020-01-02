@@ -40,10 +40,11 @@ typedef id<NSCopying>         VVSchedulerKey;
 @property (nonatomic, assign) NSUInteger maxActivations; ///< default is 8
 @property (nonatomic, assign) NSTimeInterval timeout;    ///< if timeout, will suspend temporarily; default is 60s
 @property (nonatomic, assign) NSTimeInterval durationOfSuspension; ///< if timeout, duration of suspension; default is 30s
-@property (nonatomic, assign, readonly) VVSchedulerPolicy policy;
-@property (nonatomic, strong, readonly) NSArray<VVSchedulerItem> *runningTasks;
+@property (nonatomic, assign) VVSchedulerPolicy policy;
 @property (nonatomic, assign) NSTimeInterval interval;   ///< polling interval, default is 1s, valid only for auto poll
 @property (nonatomic, assign) BOOL autoPoll;             ///< default is NO
+
+@property (nonatomic, strong, readonly) NSArray<VVSchedulerItem> *runningTasks;
 
 + (instancetype)new NS_UNAVAILABLE;
 - (instancetype)init NS_UNAVAILABLE;

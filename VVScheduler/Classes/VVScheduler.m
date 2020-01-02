@@ -9,46 +9,11 @@
 #import "VVThreadMutableArray.h"
 #import "VVThreadMutableDictionary.h"
 
-@interface NSThread (VVScheduler)
-
-+ (NSThread *)threadWithName:(NSString *)name qualityOfService:(NSQualityOfService)qualityOfService;
-
-@end
-
-@implementation NSThread (VVScheduler)
-
-+ (void)_schedulerThreadMan:(NSString *)name
-{
-    @autoreleasepool {
-        [[NSThread currentThread] setName:name];
-        NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
-        [runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
-        [runLoop run];
-    }
-}
-
-+ (NSThread *)threadWithName:(NSString *)name qualityOfService:(NSQualityOfService)qualityOfService
-{
-    NSThread *thread = [[NSThread alloc] initWithTarget:self selector:@selector(_schedulerThreadMan:) object:name];
-    thread.qualityOfService = qualityOfService;
-    [thread start];
-    return thread;
-}
-
-@end
-
 static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable tag, dispatch_queue_attr_t _Nullable attr)
 {
     static NSUInteger i = 0;
     NSString *label = [NSString stringWithFormat:@"com.enigma.scheduler.%s.%@", tag ? : "default", @(i++)];
     return dispatch_queue_create(label.UTF8String, attr);
-}
-
-static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQualityOfService qos)
-{
-    static NSUInteger i = 0;
-    NSString *name = [NSString stringWithFormat:@"com.enigma.scheduler.%@.%@", tag ? : @"thread", @(i++)];
-    return [NSThread threadWithName:name qualityOfService:qos];
 }
 
 @interface VVSchedulerItemExtra : NSObject
@@ -61,7 +26,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 @end
 
 @interface VVScheduler ()
-@property (nonatomic, assign) VVSchedulerPolicy policy;
 @property (nonatomic, strong) dispatch_source_t timer;
 @property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *runningTasks;
 @property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *suspendTasks;
@@ -69,7 +33,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 @property (nonatomic, strong) VVThreadMutableDictionary<VVSchedulerKey, VVSchedulerItemExtra *> *allExtras;
 @property (nonatomic, strong) VVMergeValve *mergeValve;
 @property (nonatomic, strong) dispatch_queue_t queue;
-@property (nonatomic, strong) NSThread *thread;
 @end
 
 @implementation VVScheduler
@@ -94,7 +57,6 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         _allTasks = [VVThreadMutableDictionary dictionary];
         _allExtras = [VVThreadMutableDictionary dictionary];
         _queue = dispatch_create_scheduler_queue(NULL, DISPATCH_QUEUE_CONCURRENT);
-        _thread = dispatch_create_scheduler_thread(nil, NSQualityOfServiceUserInitiated);
         [self setupTimer];
         [self setupMergeValve];
     }
@@ -107,10 +69,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     __weak typeof(self) weakSelf = self;
     [_mergeValve setMergeAction:^(NSArray *objects, NSDictionary *keyObjects) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        //NSLog(@"---> merge scheduler: %@, %@", @(objects.count), @(CFAbsoluteTimeGetCurrent()));
+        //NSLog(@"#-> %p: %s %@", strongSelf, __PRETTY_FUNCTION__, @(objects.count));
         dispatch_async(strongSelf.queue, ^{
-                           [strongSelf poll];
-                       });
+            [strongSelf poll];
+        });
     }];
 }
 
@@ -148,14 +110,14 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)delayPoll
 {
-    //NSLog(@"---> delayPoll");
+    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
     [[self class] cancelPreviousPerformRequestsWithTarget:self selector:@selector(_delayPoll) object:nil];
     [self performSelector:@selector(_delayPoll) withObject:nil afterDelay:10];
 }
 
 - (void)_delayPoll
 {
-    //NSLog(@"---> _delayPoll");
+    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
     [self manualPoll];
 }
 
@@ -172,7 +134,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
         }];
     }
      */
-    //NSLog(@"---> [0]queue:%@,suspend:%@", @(_runningTasks.count), @(_suspendTasks.count));
+    //NSLog(@"#-> %p: %s [0] queue:%@,suspend:%@", self, __PRETTY_FUNCTION__, @(_runningTasks.count), @(_suspendTasks.count));
     // running
     NSMutableArray *completedTasks = [NSMutableArray array];
     NSMutableArray *completedIds = [NSMutableArray array];
@@ -190,7 +152,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
                 BOOL delay = fractionCompleted <= extra.lastProgress && now - extra.updateAt > _timeout;
                 if (running >= _maxActivations || delay) {
                     if (delay) extra.suspendTime = now;
-                    [(NSObject *)task performSelector:@selector(suspend) onThread:self.thread withObject:nil waitUntilDone:NO];
+                    dispatch_async(self.queue, ^{ [task suspend]; });
                     pause++;
                 } else {
                     extra.updateAt = now;
@@ -202,8 +164,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
             case VVSchedulerTaskStateSuspended: {
                 BOOL wakeup = extra.suspendTime == 0 || (now - extra.suspendTime > _durationOfSuspension);
                 if (running < _maxActivations && wakeup) {
-                    [(NSObject *)task performSelector:@selector(resume) onThread:self.thread withObject:nil waitUntilDone:NO];
-                    //NSLog(@"---> resume: %@", task);
+                    dispatch_async(self.queue, ^{ [task resume]; });
                     extra.updateAt = now;
                     extra.lastProgress = task.progress.fractionCompleted;
                     extra.suspendTime = 0;
@@ -225,27 +186,28 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     [_runningTasks removeObjectsInArray:completedTasks];
     [_allTasks removeObjectsForKeys:completedIds];
     [_allExtras removeObjectsForKeys:completedIds];
-    //NSLog(@"---> [2]queue:%@,suspend:%@,run:%@,pause:%@,resume:%@,completed:%@", @(_runningTasks.count), @(_suspendTasks.count), @(running), @(pause), @(resume), @(completedTasks.count));
+    //NSLog(@"#-> %p: %s [1] queue:%@,suspend:%@,run:%@,pause:%@,resume:%@,completed:%@", self, __PRETTY_FUNCTION__, @(_runningTasks.count), @(_suspendTasks.count), @(running), @(pause), @(resume), @(completedTasks.count));
     [completedTasks removeAllObjects];
     [completedIds removeAllObjects];
     if (!_autoPoll) {
-        [self performSelector:@selector(delayPoll) onThread:self.thread withObject:nil waitUntilDone:NO];
+        dispatch_async(self.queue, ^{ [self delayPoll]; });
+        //[self performSelector:@selector(delayPoll) onThread:self.thread withObject:nil waitUntilDone:NO];
     }
 }
 
 - (void)addTask:(VVSchedulerItem)task
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, task);
     VVSchedulerItem newTask = task;
     VVSchedulerItem oldTask = [_allTasks objectForKey:task.identifier];
     if (oldTask) {
         if (![oldTask isEqual:task]) {
             if (oldTask.state < VVSchedulerTaskStateCanceling) {
-                [(NSObject *)oldTask performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
+                dispatch_async(self.queue, ^{ [oldTask cancel]; });
             }
             [_runningTasks removeObject:oldTask];
             [_suspendTasks removeObject:oldTask];
             [_allTasks removeObjectForKey:task.identifier];
-            //NSLog(@"---> remove old task: %@", taskId);
         } else {
             newTask = oldTask;
         }
@@ -259,11 +221,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
     } else {
         [_runningTasks addObject:task];
     }
-    //NSLog(@"---> add task: %@", taskId);
 }
 
 - (void)addTasks:(NSArray<VVSchedulerItem> *)tasks
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, tasks);
     NSMutableArray *removeTasks = [NSMutableArray array];
     NSMutableArray *appendTasks = [NSMutableArray array];
     NSMutableArray *removeKeys = [NSMutableArray array];
@@ -276,7 +238,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
             [removeKeys addObject:oldTask.identifier];
             if (![oldTask isEqual:task]) {
                 if (oldTask.state < VVSchedulerTaskStateCanceling) {
-                    [(NSObject *)oldTask performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
+                    dispatch_async(self.queue, ^{ [oldTask cancel]; });
                 }
             } else {
                 newTask = oldTask;
@@ -302,10 +264,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)suspendTask:(VVSchedulerKey)taskId
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskId);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
         if ([_runningTasks containsObject:task]) {
-            [(NSObject *)task performSelector:@selector(suspend) onThread:self.thread withObject:nil waitUntilDone:NO];
+            dispatch_async(self.queue, ^{ [task suspend]; });
         }
         [_runningTasks removeObject:task];
         [_suspendTasks addObject:task];
@@ -314,12 +277,13 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)suspendTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (!task) continue;
         if (task.state == VVSchedulerTaskStateRunning) {
-            [(NSObject *)task performSelector:@selector(suspend) onThread:self.thread withObject:nil waitUntilDone:NO];
+            dispatch_async(self.queue, ^{ [task suspend]; });
         }
         [changes addObject:task];
     }
@@ -329,6 +293,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)resumeTask:(VVSchedulerKey)taskId
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskId);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task && [_suspendTasks containsObject:task]) {
         [_suspendTasks removeObject:task];
@@ -361,28 +326,28 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)removeTask:(VVSchedulerKey)taskId cancel:(BOOL)cancel
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskId);
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
         if (cancel && task.state < VVSchedulerTaskStateCanceling) {
-            //NSLog(@"---> cancel task: %@", taskId);
-            [(NSObject *)task performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
+            dispatch_async(self.queue, ^{ [task cancel]; });
         }
         [_runningTasks removeObject:task];
         [_suspendTasks removeObject:task];
         [_allTasks removeObjectForKey:taskId];
         [_allExtras removeObjectForKey:taskId];
-        //NSLog(@"---> remove task: %@", taskId);
     }
 }
 
 - (void)cancelAndRemoveTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (!task) continue;
         if (task.state < VVSchedulerTaskStateCanceling) {
-            [(NSObject *)task performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
+            dispatch_async(self.queue, ^{ [task cancel]; });
         }
         [changes addObject:task];
     }
@@ -394,9 +359,10 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)cancelAndRemoveAllTasks
 {
+    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
     for (VVSchedulerItem task in _allTasks.allValues) {
         if (task.state < VVSchedulerTaskStateCanceling) {
-            [(NSObject *)task performSelector:@selector(cancel) onThread:self.thread withObject:nil waitUntilDone:NO];
+            dispatch_async(self.queue, ^{ [task cancel]; });
         }
     }
     [_runningTasks removeAllObjects];
@@ -406,11 +372,11 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 }
 
 - (void)prioritizeTask:(VVSchedulerKey)taskId {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskId);
     if (!taskId) return;
 
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
-        //NSLog(@"---> prioritize task: %@", taskId);
         [_suspendTasks removeObject:task];
         [_runningTasks removeObject:task];
         [_runningTasks insertObject:task atIndex:0];
@@ -430,6 +396,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)prioritizeTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
     NSMutableArray *changes = [NSMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
@@ -482,6 +449,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)addObject:(id)object forKey:(id<NSCopying>)key
 {
+    //NSLog(@"#-> %p: %s %@ %@", self, __PRETTY_FUNCTION__, key, object);
     if (!key) return;
 
     if (self.keyObjects.count == 0) {
@@ -551,6 +519,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 
 - (void)addObject:(id)object
 {
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, object);
     if (self.objects.count == 0 && !_running) {
         _running = YES;
         dispatch_resume(self.timer);
@@ -596,6 +565,7 @@ static NSThread * dispatch_create_scheduler_thread(NSString *_Nullable tag, NSQu
 }
 
 - (void)execute {
+    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
     !self.action ? : self.action();
 }
 
