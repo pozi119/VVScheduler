@@ -36,6 +36,10 @@
     return self;
 }
 
+- (void)dealloc {
+    CFRelease(_array);
+}
+
 //MARK: - primitive methods
 
 - (NSUInteger)count

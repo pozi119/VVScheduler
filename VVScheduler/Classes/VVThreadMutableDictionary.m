@@ -52,6 +52,10 @@
     return self;
 }
 
+- (void)dealloc {
+    CFRelease(_dictionary);
+}
+
 //MARK: - primitive methods
 - (NSUInteger)count
 {
@@ -109,8 +113,7 @@
 
     CFArrayRef array = CFArrayCreate(kCFAllocatorDefault, keys, count, &kCFTypeArrayCallBacks);
     free((void *)keys);
-
-    enumerator = [(__bridge NSArray *)array objectEnumerator];
+    enumerator = [CFBridgingRelease(array) objectEnumerator];
     [_lock unlock];
 
     return enumerator;

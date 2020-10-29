@@ -6,8 +6,37 @@
 //
 
 #import "VVScheduler.h"
-#import "VVThreadMutableArray.h"
-#import "VVThreadMutableDictionary.h"
+#import <pthread/pthread.h>
+#import  "VVThreadMutableArray.h"
+#import  "VVThreadMutableDictionary.h"
+
+@interface NSThread (VVScheduler)
+
++ (NSThread *)threadWithName:(NSString *)name qualityOfService:(NSQualityOfService)qualityOfService;
+
+@end
+
+@implementation NSThread (VVScheduler)
+
++ (void)_schedulerThreadMan:(NSString *)name
+{
+    @autoreleasepool {
+        [[NSThread currentThread] setName:name];
+        NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+        [runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+        [runLoop run];
+    }
+}
+
++ (NSThread *)threadWithName:(NSString *)name qualityOfService:(NSQualityOfService)qualityOfService
+{
+    NSThread *thread = [[NSThread alloc] initWithTarget:self selector:@selector(_schedulerThreadMan:) object:name];
+    thread.qualityOfService = qualityOfService;
+    [thread start];
+    return thread;
+}
+
+@end
 
 static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable tag, dispatch_queue_attr_t _Nullable attr)
 {
@@ -27,11 +56,13 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
 @interface VVScheduler ()
 @property (nonatomic, strong) dispatch_source_t timer;
+@property (nonatomic, assign) BOOL active;
 @property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *runningTasks;
 @property (nonatomic, strong) VVThreadMutableArray<VVSchedulerItem> *suspendTasks;
 @property (nonatomic, strong) VVThreadMutableDictionary<VVSchedulerKey, VVSchedulerItem> *allTasks;
 @property (nonatomic, strong) VVThreadMutableDictionary<VVSchedulerKey, VVSchedulerItemExtra *> *allExtras;
 @property (nonatomic, strong) VVMergeValve *mergeValve;
+@property (nonatomic, strong) VVLastValve *lastValve;
 @property (nonatomic, strong) dispatch_queue_t queue;
 @end
 
@@ -59,6 +90,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
         _queue = dispatch_create_scheduler_queue(NULL, DISPATCH_QUEUE_CONCURRENT);
         [self setupTimer];
         [self setupMergeValve];
+        [self setupLastValve];
     }
     return self;
 }
@@ -66,18 +98,24 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 - (void)setupMergeValve
 {
     _mergeValve = [[VVMergeValve alloc] init];
-    __weak typeof(self) weakSelf = self;
+    __weak typeof(self) weakself = self;
     [_mergeValve setMergeAction:^(NSArray *objects, NSDictionary *keyObjects) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        //NSLog(@"#-> %p: %s %@", strongSelf, __PRETTY_FUNCTION__, @(objects.count));
-        dispatch_async(strongSelf.queue, ^{
-            [strongSelf poll];
-        });
+        __strong typeof(weakself) strongself = weakself;
+        if (!strongself) return;
+        //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, @(objects.count));
+        dispatch_async(strongself.queue, ^{ [strongself poll]; });
     }];
+}
+
+- (void)setupLastValve
+{
+    _lastValve = [[VVLastValve alloc] init];
+    _lastValve.interval = 10.0;
 }
 
 - (void)dealloc
 {
+    if (!_active) dispatch_resume(_timer);
     dispatch_cancel(_timer);
     _timer = nil;
 }
@@ -86,8 +124,10 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 {
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.queue);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, _interval * NSEC_PER_SEC), _interval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    __weak typeof(self) weakself = self;
     dispatch_source_set_event_handler(_timer, ^{
-        [self poll];
+        __strong typeof(weakself) strongself = weakself;
+        [strongself poll];
     });
 }
 
@@ -96,29 +136,31 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     _autoPoll = autoPoll;
     if (autoPoll) {
         dispatch_resume(self.timer);
+        _active = YES;
     } else {
         dispatch_suspend(self.timer);
+        _active = NO;
     }
 }
 
 - (void)manualPoll
 {
-    static NSUInteger i = 0;
-    i++;
-    [self.mergeValve addObject:@(i) forKey:@(i)];
+    [self.mergeValve addObject:@(0) forKey:@(0)];
 }
 
 - (void)delayPoll
 {
+    if (self.runningTasks.count == 0) return;
     //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
-    [[self class] cancelPreviousPerformRequestsWithTarget:self selector:@selector(_delayPoll) object:nil];
-    [self performSelector:@selector(_delayPoll) withObject:nil afterDelay:10];
-}
 
-- (void)_delayPoll
-{
-    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
-    [self manualPoll];
+    __weak typeof(self) weakself = self;
+    [self.lastValve doAction:^{
+        __strong typeof(weakself) strongself = weakself;
+        if (!strongself) {
+            return;
+        }
+        [strongself manualPoll];
+    }];
 }
 
 - (void)poll
@@ -128,19 +170,20 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     }
     //MARK: VVSchedulerPolicyPriority not supported
     /*
-    if (_policy == VVSchedulerPolicyPriority) {
-        [_runningTasks sortUsingComparator:^NSComparisonResult (VVSchedulerItem task1, VVSchedulerItem task2) {
+     if (_policy == VVSchedulerPolicyPriority) {
+         [_runningTasks sortUsingComparator:^NSComparisonResult (VVSchedulerItem task1, VVSchedulerItem task2) {
             return task1.priority > task2.priority ? NSOrderedAscending : NSOrderedDescending;
-        }];
-    }
+         }];
+     }
      */
     //NSLog(@"#-> %p: %s [0] queue:%@,suspend:%@", self, __PRETTY_FUNCTION__, @(_runningTasks.count), @(_suspendTasks.count));
     // running
-    NSMutableArray *completedTasks = [NSMutableArray array];
-    NSMutableArray *completedIds = [NSMutableArray array];
+    VVThreadMutableArray *completedTasks = [VVThreadMutableArray array];
+    VVThreadMutableArray *completedIds = [VVThreadMutableArray array];
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     NSUInteger running = 0, pause = 0, resume = 0;
-    for (VVSchedulerItem task in _runningTasks) {
+    NSArray *runningTasks = [NSArray arrayWithArray:_runningTasks];
+    for (VVSchedulerItem task in runningTasks) {
         VVSchedulerItemExtra *extra = _allExtras[task.identifier];
         if (!extra) {
             extra = [VVSchedulerItemExtra new];
@@ -190,8 +233,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     [completedTasks removeAllObjects];
     [completedIds removeAllObjects];
     if (!_autoPoll) {
-        dispatch_async(self.queue, ^{ [self delayPoll]; });
-        //[self performSelector:@selector(delayPoll) onThread:self.thread withObject:nil waitUntilDone:NO];
+        [self delayPoll];
     }
 }
 
@@ -208,6 +250,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
             [_runningTasks removeObject:oldTask];
             [_suspendTasks removeObject:oldTask];
             [_allTasks removeObjectForKey:task.identifier];
+            //NSLog(@"#-> remove old task: %@", taskId);
         } else {
             newTask = oldTask;
         }
@@ -221,15 +264,16 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     } else {
         [_runningTasks addObject:task];
     }
+    //NSLog(@"#-> add task: %@", taskId);
 }
 
 - (void)addTasks:(NSArray<VVSchedulerItem> *)tasks
 {
     //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, tasks);
-    NSMutableArray *removeTasks = [NSMutableArray array];
-    NSMutableArray *appendTasks = [NSMutableArray array];
-    NSMutableArray *removeKeys = [NSMutableArray array];
-    NSMutableDictionary *apppendKeyItems = [NSMutableDictionary dictionary];
+    VVThreadMutableArray *removeTasks = [VVThreadMutableArray array];
+    VVThreadMutableArray *appendTasks = [VVThreadMutableArray array];
+    VVThreadMutableArray *removeKeys = [VVThreadMutableArray array];
+    VVThreadMutableDictionary *apppendKeyItems = [VVThreadMutableDictionary dictionary];
     for (VVSchedulerItem task in tasks) {
         VVSchedulerItem oldTask = [_allTasks objectForKey:task.identifier];
         VVSchedulerItem newTask = task;
@@ -278,7 +322,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 - (void)suspendTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
     //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
-    NSMutableArray *changes = [NSMutableArray array];
+    VVThreadMutableArray *changes = [VVThreadMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (!task) continue;
@@ -303,7 +347,8 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
 - (void)resumeTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
-    NSMutableArray *changes = [NSMutableArray array];
+    //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
+    VVThreadMutableArray *changes = [VVThreadMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (task && [_suspendTasks containsObject:task]) {
@@ -342,7 +387,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 - (void)cancelAndRemoveTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
     //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
-    NSMutableArray *changes = [NSMutableArray array];
+    VVThreadMutableArray *changes = [VVThreadMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (!task) continue;
@@ -377,19 +422,20 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
     VVSchedulerItem task = [_allTasks objectForKey:taskId];
     if (task) {
+        //NSLog(@"#-> prioritize task: %@", taskId);
         [_suspendTasks removeObject:task];
         [_runningTasks removeObject:task];
         [_runningTasks insertObject:task atIndex:0];
 
         //MARK: VVSchedulerPolicyPriority not supported
         /*
-        if (_policy == VVSchedulerPolicyPriority) {
-            float maxPriority = 0;
-            for (VVSchedulerItem task in _runningTasks) {
-                maxPriority = MAX(maxPriority, task.priority);
-            }
-            task.priority = maxPriority + (1 - maxPriority) / (_runningTasks.count * 1.0);
-        }
+         if (_policy == VVSchedulerPolicyPriority) {
+         float maxPriority = 0;
+         for (VVSchedulerItem task in _runningTasks) {
+         maxPriority = MAX(maxPriority, task.priority);
+         }
+         task.priority = maxPriority + (1 - maxPriority) / (_runningTasks.count * 1.0);
+         }
          */
     }
 }
@@ -397,7 +443,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 - (void)prioritizeTasks:(NSArray<VVSchedulerKey> *)taskIds
 {
     //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, taskIds);
-    NSMutableArray *changes = [NSMutableArray array];
+    VVThreadMutableArray *changes = [VVThreadMutableArray array];
     for (NSString *taskId in taskIds) {
         VVSchedulerItem task = [_allTasks objectForKey:taskId];
         if (!task) continue;
@@ -442,7 +488,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
         _maxMergeCount = 100;
         _objects = [VVThreadMutableArray array];
         _keyObjects = [VVThreadMutableDictionary dictionary];
-        _queue = dispatch_create_scheduler_queue("merge", DISPATCH_QUEUE_SERIAL);
+        _queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     }
     return self;
 }
@@ -472,21 +518,23 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
 - (void)runMergeOpreation
 {
-    if (!self.mergeAction) return;
-    NSArray *objects = self.objects.copy;
-    NSDictionary *keyObjects = self.keyObjects.copy;
-    [self.objects removeAllObjects];
-    [self.keyObjects removeAllObjects];
-    self.mergeAction(objects, keyObjects);
+    @synchronized (self) {
+        //NSLog(@"#-> %p: %s, %@", self, __PRETTY_FUNCTION__, @(self.objects.count));
+        if (!self.mergeAction) return;
+        NSArray *objects = [NSArray arrayWithArray:self.objects];
+        NSDictionary *keyObjects = [NSDictionary dictionaryWithDictionary:self.keyObjects];
+        [self.objects removeAllObjects];
+        [self.keyObjects removeAllObjects];
+        self.mergeAction(objects, keyObjects);
+    }
 }
 
 @end
 
 @interface VVLimitValve ()
-@property (nonatomic, strong) dispatch_queue_t queue;
 @property (nonatomic, strong) dispatch_source_t timer;
 @property (nonatomic, strong) VVThreadMutableArray *objects;
-@property (nonatomic, assign) BOOL running;
+@property (nonatomic, assign) BOOL active;
 @end
 
 @implementation VVLimitValve
@@ -496,7 +544,7 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     self = [super init];
     if (self) {
         _objects = [VVThreadMutableArray array];
-        _queue = dispatch_create_scheduler_queue("limit", DISPATCH_QUEUE_SERIAL);
+        _interval = 0.1;
         [self setupTimer];
     }
     return self;
@@ -504,25 +552,35 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
 - (void)dealloc
 {
+    if (!_active) dispatch_resume(_timer);
     dispatch_cancel(_timer);
     _timer = nil;
 }
 
 - (void)setupTimer
 {
-    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, _interval * NSEC_PER_SEC), _interval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    __weak typeof(self) weakself = self;
     dispatch_source_set_event_handler(_timer, ^{
-        [self poll];
+        __strong typeof(weakself) strongself = weakself;
+        [strongself poll];
     });
+}
+
+- (void)setInterval:(NSTimeInterval)interval
+{
+    _interval = interval;
+    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, _interval * NSEC_PER_SEC), _interval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
 }
 
 - (void)addObject:(id)object
 {
     //NSLog(@"#-> %p: %s %@", self, __PRETTY_FUNCTION__, object);
-    if (self.objects.count == 0 && !_running) {
-        _running = YES;
+    if (self.objects.count == 0 && !_active) {
         dispatch_resume(self.timer);
+        _active = YES;
     }
     [self.objects addObject:object];
 }
@@ -532,9 +590,9 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
     if (self.objects.count > 0) {
         id object = self.objects.firstObject;
         [self.objects removeObjectAtIndex:0];
-        if (self.objects.count == 0 && _running) {
+        if (self.objects.count == 0 && _active) {
             dispatch_suspend(self.timer);
-            _running = NO;
+            _active = NO;
         }
         if (self.takeAction) self.takeAction(object);
     }
@@ -542,67 +600,67 @@ static dispatch_queue_t dispatch_create_scheduler_queue(const char *_Nullable ta
 
 @end
 
-@interface _VVLastValve : NSObject
-@property (nonatomic, assign) NSTimeInterval interval;
+@interface VVLastValve ()
+@property (nonatomic, strong) dispatch_source_t timer;
+@property (nonatomic, assign) BOOL active;
 @property (nonatomic, copy) void (^ action)(void);
 @end
 
-@implementation _VVLastValve
+@implementation VVLastValve
 
 - (instancetype)init
 {
     self = [super init];
     if (self) {
-        _interval = 0.2;
+        _interval = 0.3;
+        [self setupTimer];
     }
     return self;
 }
 
-- (void)doAction:(void (^)(void))action {
-    self.action = action;
-    [[self class] cancelPreviousPerformRequestsWithTarget:self selector:@selector(execute) object:nil];
-    [self performSelector:@selector(execute) withObject:nil afterDelay:_interval];
-}
-
-- (void)execute {
-    //NSLog(@"#-> %p: %s", self, __PRETTY_FUNCTION__);
-    !self.action ? : self.action();
-}
-
-@end
-
-@implementation VVLastValve
-
-+ (NSMutableDictionary<id<NSCopying>, _VVLastValve *> *)valves
+- (void)setupTimer
 {
-    static NSMutableDictionary *_valves;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        _valves = [NSMutableDictionary dictionary];
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, _interval * NSEC_PER_SEC), _interval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    __weak typeof(self) weakself = self;
+    dispatch_source_set_event_handler(_timer, ^{
+        __strong typeof(weakself) strongself = weakself;
+        [strongself execute];
     });
-    return _valves;
 }
 
-+ (_VVLastValve *)valveForIdentifier:(id<NSCopying>)identifier
+- (void)setInterval:(NSTimeInterval)interval
 {
-    _VVLastValve *valve = [[self valves] objectForKey:identifier];
-    if (!valve) {
-        valve = [[_VVLastValve alloc] init];
-        [[self valves] setObject:valve forKey:identifier];
+    _interval = interval;
+    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, _interval * NSEC_PER_SEC), _interval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+}
+
+- (void)doAction:(void (^)(void))action
+{
+    self.action = action;
+    //NSLog(@"#-> %p[%@]: %s", self, @(_interval), __PRETTY_FUNCTION__);
+    if (!_active) {
+        dispatch_resume(_timer);
+        _active = YES;
     }
-    return valve;
 }
 
-+ (void)setInterval:(NSTimeInterval)interval forIdenitifer:(id<NSCopying>)identifier
+- (void)execute
 {
-    _VVLastValve *valve = [self valveForIdentifier:identifier];
-    valve.interval = interval;
+    if (!_active) return;
+
+    //NSLog(@"#-> %p[%@]: %s", self, @(_interval), __PRETTY_FUNCTION__);
+    !self.action ? : self.action();
+    dispatch_suspend(_timer);
+    _active = NO;
 }
 
-+ (void)doAction:(nonnull void (^)(void))action forIdenitifer:(id<NSCopying>)identifier
+- (void)dealloc
 {
-    _VVLastValve *valve = [self valveForIdentifier:identifier];
-    [valve doAction:action];
+    if (!_active) dispatch_resume(_timer);
+    dispatch_cancel(_timer);
+    _timer = nil;
 }
 
 @end

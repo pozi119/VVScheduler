@@ -12,7 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM (NSUInteger, VVSchedulerPolicy) {
     VVSchedulerPolicyLIFO,
     VVSchedulerPolicyFIFO,
-//    VVSchedulerPolicyPriority,
+    //    VVSchedulerPolicyPriority,
 };
 
 typedef NS_ENUM (NSInteger, VVSchedulerTaskState) {
@@ -103,8 +103,9 @@ typedef id<NSCopying>         VVSchedulerKey;
 @end
 
 @interface VVLastValve : NSObject
-+ (void)setInterval:(NSTimeInterval)interval forIdenitifer:(id<NSCopying>)identifier;
-+ (void)doAction:(nonnull void (^)(void))action forIdenitifer:(id<NSCopying>)identifier;
+@property (nonatomic, assign) NSTimeInterval interval;
+
+- (void)doAction:(void (^)(void))action;
 @end
 
 NS_ASSUME_NONNULL_END
